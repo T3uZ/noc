@@ -1,97 +1,122 @@
 from fastapi import FastAPI, HTTPException
-from sqlalchemy import or_
+from sqlalchemy import func
 from database import Base, engine, SessionLocal
 from models import Event
 from config import SECRET_TOKEN
 from ai_agent import ask_ai
-import re
-from sqlalchemy import func
+from datetime import datetime, timedelta
 import json
+import re
 
 app = FastAPI(title="NOC AI API")
 
 Base.metadata.create_all(bind=engine)
 
-# =========================
-# RECEBER WEBHOOK ZABBIX
-# =========================
+# =========================================================
+# 🔎 CONFIGURAÇÕES INTELIGENTES
+# =========================================================
+
+STOPWORDS = {
+    "para", "teve", "tivemos", "alerta", "equipamento",
+    "host", "ainda", "esta", "está", "algum", "alguma",
+    "hoje", "ontem", "problema", "problemas", "do", "da",
+    "de", "no", "na"
+}
+
+STATUS_KEYWORDS = {
+    "fora": "PROBLEM",
+    "down": "PROBLEM",
+    "problema": "PROBLEM",
+    "alerta": "PROBLEM",
+    "erro": "PROBLEM",
+    "ok": "OK",
+    "normal": "OK",
+    "resolvido": "OK"
+}
+
+SEVERITY_KEYWORDS = {
+    "warning": "Warning",
+    "average": "Average",
+    "high": "High",
+    "disaster": "Disaster"
+}
+
+MAX_EVENTS_QUERY = 100
+
+
+# =========================================================
+# 🩺 HEALTHCHECK
+# =========================================================
+@app.get("/health")
+def health():
+    return {"status": "running"}
+
+
+# =========================================================
+# 📥 WEBHOOK ZABBIX
+# =========================================================
 @app.post("/zabbix/webhook")
 async def receive_event(payload: dict):
-
-    print("==== WEBHOOK RECEBIDO ====")
-    print(json.dumps(payload, indent=2))
 
     if payload.get("token") != SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-    db = SessionLocal()
+    required_fields = ["event_id", "host", "trigger_name", "status", "severity"]
 
-    existing = db.query(Event).filter(
-        Event.event_id == payload["event_id"]
-    ).first()
-
-    if existing:
-        db.close()
-        return {"status": "already_exists"}
-
-    event = Event(
-        event_id=payload["event_id"],
-        host=payload["host"],
-        trigger_name=payload["trigger_name"],
-        status=payload["status"],
-        severity=payload["severity"],
-        raw_data=json.dumps(payload)
-    )
-
-    db.add(event)
-    db.commit()
-    db.close()
-
-    return {"status": "saved"}
-
-
-# =========================
-# BUSCA FLEXÍVEL POR HOST
-# =========================
-def find_hosts_like(db, partial_name: str):
-    return db.query(Event.host)\
-        .filter(Event.host.ilike(f"%{partial_name}%"))\
-        .distinct()\
-        .all()
-
-
-# =========================
-# CONSULTAR EVENTOS POR HOST (PARCIAL)
-# =========================
-@app.get("/events/search/{partial_host}")
-def search_events(partial_host: str):
+    for field in required_fields:
+        if field not in payload:
+            raise HTTPException(status_code=400, detail=f"Missing field: {field}")
 
     db = SessionLocal()
 
-    hosts = find_hosts_like(db, partial_host)
+    try:
+        existing = db.query(Event).filter(
+            Event.event_id == payload["event_id"]
+        ).first()
 
-    if not hosts:
+        if existing:
+            return {"status": "already_exists"}
+
+        event = Event(
+            event_id=str(payload["event_id"]),
+            host=payload["host"],
+            trigger_name=payload["trigger_name"],
+            status=payload["status"].upper(),
+            severity=payload["severity"].capitalize(),
+            raw_data=json.dumps(payload)
+        )
+
+        db.add(event)
+        db.commit()
+
+        return {"status": "saved"}
+
+    finally:
         db.close()
-        return {"message": "Nenhum host encontrado."}
 
-    result = {}
 
-    for (host_name,) in hosts:
-        events = db.query(Event)\
-            .filter(Event.host == host_name)\
-            .order_by(Event.created_at.desc())\
-            .limit(20)\
+# =========================================================
+# 🔍 BUSCA FLEXÍVEL DE HOST
+# =========================================================
+def find_hosts_by_keywords(db, keywords):
+
+    host_scores = {}
+
+    for word in keywords:
+        matches = db.query(Event.host)\
+            .filter(func.lower(Event.host).like(f"%{word}%"))\
+            .distinct()\
             .all()
 
-        result[host_name] = events
+        for (host_name,) in matches:
+            host_scores[host_name] = host_scores.get(host_name, 0) + 1
 
-    db.close()
-    return result
+    return sorted(host_scores, key=host_scores.get, reverse=True)
 
 
-# =========================
-# PERGUNTAR PARA IA
-# =========================
+# =========================================================
+# 🤖 PERGUNTAS INTELIGENTES NOC
+# =========================================================
 @app.post("/ask")
 def ask_host(data: dict):
 
@@ -102,80 +127,153 @@ def ask_host(data: dict):
 
     db = SessionLocal()
 
-    # 🔎 Extrai palavras relevantes
-    words = re.findall(r'[a-z0-9\-]{3,}', question)
+    try:
+        now = datetime.utcnow()
+        start_time = None
+        end_time = now
 
-    # remove palavras muito genéricas
-    stopwords = {"para", "teve", "tivemos", "alerta", "equipamento", "host", "ainda", "esta", "está"}
-    words = [w for w in words if w not in stopwords]
+        # -------------------------------------
+        # 🕒 Detectar período
+        # -------------------------------------
+        if "hoje" in question:
+            start_time = datetime(now.year, now.month, now.day)
 
-    if not words:
-        db.close()
-        return {"response": "Não consegui identificar o host na pergunta."}
+        elif "ontem" in question:
+            yesterday = now - timedelta(days=1)
+            start_time = datetime(yesterday.year, yesterday.month, yesterday.day)
+            end_time = start_time + timedelta(days=1)
 
-    # 🎯 Ranking por ocorrência
-    host_scores = {}
+        elif "24h" in question or "últimas 24" in question:
+            start_time = now - timedelta(hours=24)
 
-    for word in words:
-        matches = db.query(Event.host)\
-            .filter(func.lower(Event.host).like(f"%{word}%"))\
-            .distinct()\
-            .all()
+        # -------------------------------------
+        # 🎯 Detectar severidade
+        # -------------------------------------
+        severity_filter = None
+        for key in SEVERITY_KEYWORDS:
+            if key in question:
+                severity_filter = SEVERITY_KEYWORDS[key]
 
-        for (host_name,) in matches:
-            host_scores[host_name] = host_scores.get(host_name, 0) + 1
+        # -------------------------------------
+        # 🎯 Detectar status
+        # -------------------------------------
+        status_filter = None
+        for key in STATUS_KEYWORDS:
+            if key in question:
+                status_filter = STATUS_KEYWORDS[key]
 
-    if not host_scores:
-        db.close()
-        return {"response": "Nenhum host correspondente encontrado."}
+        # -------------------------------------
+        # 🔎 Extrair palavras
+        # -------------------------------------
+        words = re.findall(r'[a-z0-9\-]{3,}', question)
+        words = [w for w in words if w not in STOPWORDS]
 
-    # Ordena por relevância
-    sorted_hosts = sorted(host_scores, key=host_scores.get, reverse=True)
+        # =====================================================
+        # 🔥 PERGUNTA GLOBAL (SEM HOST)
+        # =====================================================
+        if not words:
 
-    # Limita aos 3 mais relevantes
-    sorted_hosts = sorted_hosts[:3]
+            query = db.query(Event)
 
-    context_data = {}
+            if start_time:
+                query = query.filter(Event.created_at >= start_time)
+                query = query.filter(Event.created_at <= end_time)
 
-    for host_name in sorted_hosts:
-        events = db.query(Event)\
-            .filter(Event.host == host_name)\
-            .order_by(Event.created_at.desc())\
-            .limit(30)\
-            .all()
+            if status_filter:
+                query = query.filter(Event.status == status_filter)
 
-        total = len(events)
-        open_problems = sum(1 for e in events if e.status == "PROBLEM")
-        last_status = events[0].status if events else "Unknown"
-        last_event = events[0].trigger_name if events else None
-        last_severity = events[0].severity if events else None
+            if severity_filter:
+                query = query.filter(Event.severity == severity_filter)
 
-        context_data[host_name] = {
-            "score": host_scores[host_name],
-            "total_events": total,
-            "open_problems": open_problems,
-            "last_status": last_status,
-            "last_event": last_event,
-            "last_severity": last_severity
-        }
+            events = query.order_by(Event.created_at.desc())\
+                          .limit(MAX_EVENTS_QUERY)\
+                          .all()
 
-    db.close()
+            total = len(events)
+            problems = sum(1 for e in events if e.status == "PROBLEM")
 
-    # 🔥 Se quiser resposta direta sem IA quando for pergunta simples:
-    if "fora" in question or "down" in question:
+            if total == 0:
+                return {"response": "Nenhum evento encontrado no período solicitado."}
+
+            return {
+                "response": f"Foram registrados {total} eventos. "
+                            f"{problems} estão em estado PROBLEM."
+            }
+
+        # =====================================================
+        # 🔎 BUSCA POR HOST
+        # =====================================================
+        sorted_hosts = find_hosts_by_keywords(db, words)
+
+        if not sorted_hosts:
+            return {"response": "Nenhum host correspondente encontrado."}
+
+        sorted_hosts = sorted_hosts[:3]
+
+        context_data = {}
+
+        for host_name in sorted_hosts:
+
+            query = db.query(Event).filter(Event.host == host_name)
+
+            if start_time:
+                query = query.filter(Event.created_at >= start_time)
+                query = query.filter(Event.created_at <= end_time)
+
+            if status_filter:
+                query = query.filter(Event.status == status_filter)
+
+            if severity_filter:
+                query = query.filter(Event.severity == severity_filter)
+
+            events = query.order_by(Event.created_at.desc())\
+                          .limit(MAX_EVENTS_QUERY)\
+                          .all()
+
+            total = len(events)
+            open_problems = sum(1 for e in events if e.status == "PROBLEM")
+            last_event = events[0] if events else None
+
+            context_data[host_name] = {
+                "total_events": total,
+                "open_problems": open_problems,
+                "last_status": last_event.status if last_event else None,
+                "last_event": last_event.trigger_name if last_event else None,
+                "last_severity": last_event.severity if last_event else None,
+                "last_time": str(last_event.created_at) if last_event else None
+            }
+
         main_host = sorted_hosts[0]
-        if context_data[main_host]["last_status"] == "PROBLEM":
+        host_data = context_data[main_host]
+
+        # =====================================================
+        # 🔥 RESPOSTAS DIRETAS (SEM IA)
+        # =====================================================
+        if "fora" in question or "down" in question:
+            if host_data["last_status"] == "PROBLEM":
+                return {
+                    "response": f"O equipamento {main_host} está com problema. "
+                                f"Último alerta: {host_data['last_event']} "
+                                f"(Severidade: {host_data['last_severity']})."
+                }
+            else:
+                return {
+                    "response": f"O equipamento {main_host} está normal no momento."
+                }
+
+        if "quantos" in question or "quantidade" in question:
             return {
-                "response": f"O equipamento {main_host} ainda está com problema. "
-                            f"Último alerta: {context_data[main_host]['last_event']} "
-                            f"(Severidade: {context_data[main_host]['last_severity']})."
-            }
-        else:
-            return {
-                "response": f"O equipamento {main_host} está normal no momento."
+                "response": f"O host {main_host} possui "
+                            f"{host_data['total_events']} eventos no período. "
+                            f"{host_data['open_problems']} ainda abertos."
             }
 
-    # 🤖 Caso contrário, envia contexto para IA
-    response = ask_ai(question, context_data)
+        # =====================================================
+        # 🤖 PERGUNTAS ANALÍTICAS → IA
+        # =====================================================
+        ai_response = ask_ai(question, context_data)
 
-    return {"response": response}
+        return {"response": ai_response}
+
+    finally:
+        db.close()
