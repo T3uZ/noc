@@ -18,6 +18,9 @@ Base.metadata.create_all(bind=engine)
 @app.post("/zabbix/webhook")
 async def receive_event(payload: dict):
 
+    print("==== WEBHOOK RECEBIDO ====")
+    print(json.dumps(payload, indent=2))
+    
     if payload.get("token") != SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
