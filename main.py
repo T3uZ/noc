@@ -20,7 +20,7 @@ async def receive_event(payload: dict):
 
     print("==== WEBHOOK RECEBIDO ====")
     print(json.dumps(payload, indent=2))
-    
+
     if payload.get("token") != SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
@@ -95,35 +95,49 @@ def search_events(partial_host: str):
 @app.post("/ask")
 def ask_host(data: dict):
 
-    question = data.get("question")
+    question = data.get("question", "").lower().strip()
+
+    if not question:
+        return {"response": "Pergunta vazia."}
 
     db = SessionLocal()
 
-    # 🔎 Extrai palavras em MAIÚSCULO (possíveis hosts)
-    words = re.findall(r'\b[A-Z0-9\-]{3,}\b', question)
+    # 🔎 Extrai palavras relevantes
+    words = re.findall(r'[a-z0-9\-]{3,}', question)
+
+    # remove palavras muito genéricas
+    stopwords = {"para", "teve", "tivemos", "alerta", "equipamento", "host", "ainda", "esta", "está"}
+    words = [w for w in words if w not in stopwords]
 
     if not words:
         db.close()
         return {"response": "Não consegui identificar o host na pergunta."}
 
-    possible_hosts = []
+    # 🎯 Ranking por ocorrência
+    host_scores = {}
 
     for word in words:
         matches = db.query(Event.host)\
-            .filter(Event.host.ilike(f"%{word}%"))\
+            .filter(func.lower(Event.host).like(f"%{word}%"))\
             .distinct()\
             .all()
 
         for (host_name,) in matches:
-            possible_hosts.append(host_name)
+            host_scores[host_name] = host_scores.get(host_name, 0) + 1
 
-    if not possible_hosts:
+    if not host_scores:
         db.close()
         return {"response": "Nenhum host correspondente encontrado."}
 
+    # Ordena por relevância
+    sorted_hosts = sorted(host_scores, key=host_scores.get, reverse=True)
+
+    # Limita aos 3 mais relevantes
+    sorted_hosts = sorted_hosts[:3]
+
     context_data = {}
 
-    for host_name in possible_hosts:
+    for host_name in sorted_hosts:
         events = db.query(Event)\
             .filter(Event.host == host_name)\
             .order_by(Event.created_at.desc())\
@@ -133,16 +147,35 @@ def ask_host(data: dict):
         total = len(events)
         open_problems = sum(1 for e in events if e.status == "PROBLEM")
         last_status = events[0].status if events else "Unknown"
+        last_event = events[0].trigger_name if events else None
+        last_severity = events[0].severity if events else None
 
         context_data[host_name] = {
+            "score": host_scores[host_name],
             "total_events": total,
             "open_problems": open_problems,
             "last_status": last_status,
-            "last_event": events[0].trigger_name if events else None
+            "last_event": last_event,
+            "last_severity": last_severity
         }
 
     db.close()
 
+    # 🔥 Se quiser resposta direta sem IA quando for pergunta simples:
+    if "fora" in question or "down" in question:
+        main_host = sorted_hosts[0]
+        if context_data[main_host]["last_status"] == "PROBLEM":
+            return {
+                "response": f"O equipamento {main_host} ainda está com problema. "
+                            f"Último alerta: {context_data[main_host]['last_event']} "
+                            f"(Severidade: {context_data[main_host]['last_severity']})."
+            }
+        else:
+            return {
+                "response": f"O equipamento {main_host} está normal no momento."
+            }
+
+    # 🤖 Caso contrário, envia contexto para IA
     response = ask_ai(question, context_data)
 
     return {"response": response}
